@@ -1,0 +1,664 @@
+<#GPOPatch_2024v1.ps1
+Created by: G Brown
+
+This script automates the installation of Group Policy Objects, WMI filters, and Policy Definitions accross a Domain
+
+there is a break mid-script that waits for the administrator to manually link wmi filters.  
+
+when complete, admin is to press "y then enter", then the GPOs will be linked to the prescribed location in the .json file.
+
+ToDo:
+fix the code that links the WMi filter to the GPO
+Scheduled Task GPO
+
+Created    | updated by | changes
+Nov 2 2023 | G Brown    |initial
+
+
+################################################################################
+#>
+if(!(Test-Path -Path "C:\temp")){
+New-Item -ItemType Directory "C:\temp"
+}
+
+$date=get-date -Format ddMMyyHHmmss
+$global:NewBackupPath = "C:\temp\GPOBAckup."+$date
+if(!(Test-Path -Path $NewBackupPath)){
+New-Item -ItemType Directory $NewBackupPath
+}
+
+$TranscriptPath = $NewBackupPath+"GPOPatch.log"
+
+Start-Transcript -Path $TranscriptPath -Append -Force -NoClobber
+
+#*****
+$GPOWmiPath=$PSScriptRoot+"\GPOsandWMiFilters"
+$NewStringGPOName=$null
+$gposInThisBackup=$null
+$ddomain=(gwmi win32_computersystem).domain
+$gposInThisBackup = @()
+$global:InstalledGPOdisplaynames = @()
+$global:InstalledGPOdisplaynames=(get-gpo -all | where-object {$_.DisplayName -ne "default domain policy" -and $_.DisplayName -ne "Default Domain Controllers POlicy"}).DisplayName
+$gposInThisBackup = @()
+$AllXMLFilesInThisBackup=Get-ChildItem -Path $GPOWmiPath -Filter '*.xml' -File -recurse
+$GpoWmiCsvPath = "C:\temp\GpoSTIGs_2024v1\Artifacts\GPOWMiLinks.csv"
+$JsonPath = "C:\temp\GpoSTIGs_2024v1\Artifacts\OUandGPOLinks.json"
+$PolicyDefPath = "C:\temp\GpoSTIGs_2024v1\Artifacts\PolicyDefinitions.zip"
+$global:domain=(Get-ADDomain).domain
+FUNCTION SetLMRegistry{
+write-host "#8"
+$Pathh = "HKLM:\System\CurrentControlSet\Services\NTDS\Parameters"
+$Propertyy = "Allow System Only Change"
+$DesiredValue = "0"
+$Typee = "DWORD"
+get-item -path $Pathh | New-item -name $Propertyy -Force | out-null
+Set-ItemProperty -Path $Pathh -Name $Propertyy -Value $DesiredValue
+}
+
+function backup-POlicyDefinitions{
+$date=get-date -Format ddMMyyHHmmss
+$PolicyDefDestination = $NewBackupPath+"\PolicyDefinitions"
+$EnUsDestination = $NewBackupPath+"\PolicyDefinitions\en-us"
+
+New-Item -ItemType Directory -Path $PolicyDefDestination | Out-Null
+
+if(test-path "C:\Windows\SYSVOL\domain\Policies\PolicyDefinitions"){
+gci -Filter * -File "C:\Windows\SYSVOL\domain\Policies\PolicyDefinitions" | Copy-Item -Destination $PolicyDefDestination  -Force -Recurse
+New-Item -ItemType Directory -Path $EnUsDestination
+gci -Filter * "C:\Windows\SYSVOL\domain\Policies\PolicyDefinitions\en-us" | Copy-Item -Destination $EnUsDestination  -Force -Recurse
+}
+elseif(!(Test-Path "C:\Windows\SYSVOL\domain\Policies\PolicyDefinitions")){write-host "no policy definitions to backup"}
+#Compress-Archive -Path $PolicyDefDestination -DestinationPath $NewBackupPath
+}
+
+
+function Make-GpoWmiCsv{
+$scriptPath = split-path -Parent $MyInvocation.InvocationName
+Set-Location $scriptPath
+$GPOWmiCSVPath = $NewBackupPath+"/GPOWMiLinks.csv"
+$gbAllGPOs=get-gpo -all
+
+if ($gbAllGPOs){$gbAllGPOs.ForEach({
+if ($_.wmifilter){
+$OutputLine=$_.displayname+","+$_.wmifilter.name
+$OutputLine | Out-File -NoClobber -Append -Force -FilePath $GPOWmiCSVPath
+}
+})
+}
+}
+
+function backup-backupGPOs{
+
+$gpostobackup = get-gpo -all | where-object {$_.DisplayName -ne "default domain policy" -and $_.DisplayName -ne "Default Domain Controllers POlicy"}
+
+if($gpostobackup){foreach ($Gpo2backup in $gpostobackup){
+$Gpo2backup | backup-GPO -Path $NewBackupPath}
+Get-Job | Wait-Job
+}
+}
+
+function remove-removeGPOs{
+
+$gpostoremove = get-gpo -all | where-object {$_.DisplayName -ne "default domain policy" -and $_.DisplayName -ne "Default Domain Controllers POlicy"}
+
+
+if($gpostoremove){
+foreach ($OldGPO in $gpostoremove){
+$OldGPO | Remove-GPO}
+get-job | Wait-Job
+}
+}
+
+function Remove-SameNameOldWmiFilters{
+$global:InstalledFilters= Get-ADObject -Filter * -Properties msWMI-Name |where {($_.objectClass -eq "msWMI-Som")} 
+
+foreach ($item in $InstalledFilters){
+
+$itemNAME = $item | Select -ExpandProperty "msWMi-Name"
+$itemGUID = $item | select -ExpandProperty "Name"
+
+[String]$itemGUID = $itemGUID -replace '{' -replace '}'
+$itemGUID
+
+if ($itemNAME -match $namesofNewWMiFilters){
+Write-host "You Are removing the WMi filter: $itemNAME"
+$item | Remove-ADObject -Confirm:$false
+}
+}
+}
+
+function Install-newPolicyDefinitions{
+
+try{
+if (test-path "$env:WinDir\SYSVOL\domain\Policies\PolicyDefinitions"){
+Remove-item -path "$env:WinDir\SYSVOL\domain\Policies\PolicyDefinitions" -Force -Recurse
+}
+Expand-Archive -Path $PolicyDefPath -DestinationPath "$env:WinDir\SYSVOL\domain\Policies" -Force
+}
+catch{
+write-host "Install-newPolicyDefinitions failed"
+}
+}
+
+function Import-AllGPOsFromBackup2{
+$AllGPOXMLFilesInThisBackup=Get-ChildItem -Path $GPOWmiPath -Filter '*backup.xml'  -File -recurse
+foreach($file in $AllGPOXMLFilesInThisBackup){
+
+$configFile = New-Object xml
+$configFile.Load($file.FullName)
+$NewStringGPOName=$configFile.ChildNodes.GroupPOlicyObject.GroupPolicyCoreSettings.DisplayName.InnerText
+
+if ($NewStringGPOName -ne $null){
+#$file.FullName
+
+$pathhh=($file).Directory.parent.FullName
+#$pathhh
+#set-location $file.directory
+#set-location ..
+#$pwd=pwd
+$gposInThisBackup+= $NewStringGPOName
+
+write-host "INSTALLING $($NewStringGPOName)"
+try{import-gpo -BackupGpoName $NewStringGPOName -Path $pathhh -TargetName $NewStringGPOName -CreateIfNeeded
+}catch{
+     $_.InvocationInfo.MyCommand.Name
+     $_.ErrorDetails.Message
+     $_.InvocationInfo.PositionMessage
+     $_.CategoryInfo.ToString()
+     $_.FullyQualifiedErrorId
+}
+}
+}
+}
+
+
+function Install-OUs{
+$domain= (Get-ADDomain).distinguishedname
+$alleOU = ''
+
+$a = cat $JsonPath | convertfrom-json
+#$a.ous[0]
+$actualOUs = ($a.OUs | Get-Member -MemberType NoteProperty).Name
+
+foreach ($item in $actualOUs){
+[string]$item=$item
+$ous=$item 
+#$ous
+
+$ousParent = ((Split-Path $ous -Parent).split('\'))[0]
+$ousChild = ((Split-Path $ous -Leaf).split('\'))[0]
+#$ousParent
+
+#$path = $ousParent+$domain
+try{
+if ($ousParent){
+$ousParentPLus="OU="+$ousParent+","+$domain
+New-ADOrganizationalUnit -Name $($ousChild) -Path $($ousParentPLus)
+}
+elseif(!($ousParent)){
+New-ADOrganizationalUnit -Name $($ous) -Path $($domain)
+}
+}catch{write-host "OU already exists::$ous"}
+
+}
+
+}
+
+function ContinueorExit{
+$answer=Read-Host 'Press "Y then enter" or "N then enter" to abort.'
+if ($answer -eq "y"){
+write-host "continuing"
+}
+elseif($answer -ne "y"){
+Stop-Transcript
+exit
+}
+}
+
+function Install-NewGPOLinks{
+$JsonPath = "C:\temp\GpoSTIGs_2024v1\Artifacts\OUandGPOLinks.json"
+$domainDN=(get-addomain).distinguishedname
+$canonicaldomain = (gwmi win32_computersystem).domain
+$a = cat $JsonPath | convertfrom-json
+#($a.OUs).'Domain Controllers'
+
+$OrgUnits = ($a.OUs | Get-Member -MemberType NoteProperty).Name
+
+foreach ($OU in $OrgUnits){
+$GPOs = $a.OUs.$($OU)
+
+$OUh = $canonicaldomain +"/"+ $OU
+
+$DNofOU=(Get-ADOrganizationalUnit -Filter * -Properties * | where {$_.canonicalname -eq $OUh}).distinguishedname
+$DNofOU
+foreach ($GPO in $GPOs){
+if($DNofOU){
+
+New-GPLink -Name $GPO -Target $DNofOU
+}
+}
+}
+}
+
+#WMI Code, still troubleshooting, wMiGPO linking not working
+
+function new-WMiFilter{
+[Cmdletbinding()]
+Param
+(
+[Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true, Position = 0)]
+[ValidateNotNull()]
+[String] $Name,
+
+[Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true, Position = 1)]
+[ValidateNotNull()]
+[String] $Expression,
+
+[Parameter(Mandatory = $false, ValueFromPipelineByPropertyName = $true, Position = 2)]
+[String] $Description,
+
+[Parameter(Mandatory = $false, ValueFromPipelineByPropertyName = $true, Position = 3)]
+[Switch] $PassThru
+
+)
+if ($Expression.Count -lt 1){
+    write-error "At least one expression method is required to create a wmi filter"
+    }
+
+$Guid = [System.Guid]::NewGuid()
+$defaultNamingContext = (Get-ADRootDSE).DefaultNamingContext
+$msWMIAuthor = 'Domain Admins'
+$msWMiCreationDate = (Get-Date).ToUniversalTime().ToString("yyyyMMddhhmmss.ffffff-000")
+$WMiGUID = "{$Guid}"
+$WMIDistinguishedName = "CN=$WMIGUID,CN=SOM,CN=WMiPolicy,CN=System,$defaultNamingContext"
+$msWMiParm1 = $Description
+$msWMIParm2 = $Expression
+
+$Attr = @{
+"msWMI-Name"=$Name;
+"msWMI-Parm1"=$msWMiParm1;
+"msWMI-Parm2"=$msWMParm2;
+"msWMI-Author"=$msWMIAuthor;
+"msWMI-ID"=$WMIGUID;
+"instanceType"=4;
+"showInAdvancedViewOnly"=$TRUE;
+"distinguishedname"=$WMIDistinguishedName;
+"msWMI-ChangeDate"=$msWMiCreationDate;
+"msWMi-CreationDate"=$msWMICreationDate
+}
+$WMIPath = ("CN=SOM,CN=WMiPolicy,CN=System,$defaultNamingContext")
+
+$ADObject = New-ADObject -Name $WMIGUID -Type "msWMI-SOM" -path $WMIPath -OtherAttributes $Attr -Passthru
+
+if ($PassThru){ConvertTo-WmiFilter $ADObject | Write-Output}
+
+}
+
+
+function ConvertTo-WMiFilter([Microsoft.ActiveDirectory.Management.ADObject[]] $ADObject){
+
+    Import-Module GroupPolicy
+
+    $gpDomain = New-Object -Type Microsoft.GroupPolicy.GPDomain($Domain)
+
+    $ADObject | ForEach-Object {
+        $path = 'MSFT_SOMFilter.Domain="'+ $gpDomain.DomainName + '"ID="' +$_.Name+'"'
+        try{
+            $filter=$gpdomain.getwmifilter($path)
+        }
+        catch{}
+
+        if ($filter){
+            [Guid]$Guid=$_.Name.Substring(1,$_.Name.Length - 2)
+            $filter | Add-Member -MemberType NoteProperty -Name Guid -Value $Guid -PassThru | Add-Member -MemberType NoteProperty -Name Content -Value $_."msWMI-Parm2" -PassThru | Write-Output
+        }
+    }
+}
+
+function set-gpwmifilter{
+Param
+(
+[Parameter(Mandatory =$true, ValueFromPipelineByPropertyName = $true, Position = 0, ParameterSetName = "ByGUID")]
+[ValidationNotNull()]
+[Guid[]] $Guid,
+
+[Parameter(Mandatory =$true, ValueFromPipelineByPropertyName = $true, Position = 0, ParameterSetName = "ByName")]
+[ValidationNotNull()]
+[Guid[]] $Name,
+
+[Parameter(Mandatory =$false, ValueFromPipelineByPropertyName = $true, Position = 1)]
+[ValidationNotNull()]
+[Guid[]] $Expression,
+
+[Parameter(Mandatory =$false, ValueFromPipelineByPropertyName = $true, Position = 2)]
+[ValidationNotNull()]
+[Guid[]] $Description,
+
+[Parameter(Mandatory =$false, ValueFromPipelineByPropertyName = $true, Position = 3)]
+[ValidationNotNull()]
+[Guid[]] $PassThru
+
+)
+
+if ($Guid){
+$ADObject = Get-WMIFilterInADObject -Guid $Guid
+}
+elseif ($Name){
+$ADObject = Get-WMIFilterInADObject -Name $Name}
+$msWMIAuthor = Get-Author
+$msWMIChangeDate = (Get-Date).ToUniversalTime().ToString("yyyyMMddhhmmss.ffffff-000")
+$Attr = @{
+"msWMI-Author"      =$msWMIAuthor;
+"msWMI-ChangeDate"  =$msWMIChangeDate;
+}
+if ($Expression){
+$msWMiParm2 = $Expression.Count.ToString() + ";"
+$Expression | ForEach-Object {
+$msWMiParm2 += "3;10;" + $_.Length + ";WQL;root\CIMv2;" + $_ + ";"
+}
+$Attr.Add("msWMI-Parm2" , $msWMiParm2);
+}
+elseif ($Description){
+$msWMiParm1 = $Description + " "; $msWMiParm1
+$Attr.Add("msWMI-Parm2" , $msWMIParm2);
+}
+else{Write-Warning "No content need to be set. Please set either Expression or Description."
+return
+}
+
+Enable-ADSystemOnlyChange
+
+$ADObject | ForEach-Object {
+if ($_.DistinguishedName){
+set-adobject -identity $_ $Attr
+if ($PassThru){
+ConvertTo-WMiFilter $ADObject | Write-Output
+}
+}
+}
+}
+
+
+function Get-Author{
+try{$author = (Get-ADUser -Identity $env:USERNAME -Server $env:USERDNSDOMAIN).UserPrincipalName} catch {}
+
+if ( -Not $author){
+$author = (Get-ADUser $env:USERNAME -Server $env:USERDNSDOMAIN).nAME
+}
+IF(-nOT $author){
+$author = $env:USERNAME
+}
+return $author
+}
+
+
+
+function Enable-ADSystemONlyChange([switch] $disable){
+$valueData=1
+if($disable){
+$valueData=0
+}
+$key = Get-Item HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters -ErrorAction SilentlyContinue
+if ( -Not $key){
+New-Item HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters -ItemType RegistryKey | Out-Null
+}
+$kval = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters -Name "Allow System Only Change" -ErrorAction SilentlyContinue
+if (-Not $kval){
+New-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters -Name "Allow System Only Change" -Value $valueData -PropertyType DWORD | Out-Null
+}
+else {
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters -nAME "Allow System Only Change" -value $valueData | Out-Null
+}
+}
+
+
+function get-wmifilterinADObject{
+param(
+[Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true, Position = 0, ParameterSetName = "ByGUID")]
+[ValidateNotNull()]
+[Guid[]] $Guid,
+
+[Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true, Position = 0, ParameterSetName = "ByName")]
+[VAlidateNotNull()]
+[string[]] $Name,
+
+[Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true, Position = 0, ParameterSetName = "GetAll")]
+[switch]$All
+)
+$runDomain = (gwmi win32_computersystem).domain
+$wmifilterAttr = "msWMI-Name", "msWMI-Parm1", "msWMI-Parm2", "msWMi-Author", "msWMi-ID"
+
+if ($Guid){
+$Guid | ForEach-Object {
+$ldapFilter = "(&(objectClass=msWMI-Som)(Name={$_}))"
+
+Get-ADObject -LDAPFilter $ldapFilter -Properties $wmifilterAttr -Server $runDomain | Write-Output
+}
+}
+elseif ($Name){
+$Name | ForEach-Object {
+$ldapFilter = "(&(objectClass=msWMI-Som)(msWMi-Name=$_))"
+Get-ADObject -LDAPFilter $ldapFilter -Properties $wmifilterAttr -Server $runDomain | Write-Output
+}
+}
+elseif($All){
+$ldapFilter = "(objectClass=msWMI-Som)"
+Get-ADObject -LDAPFilter $ldapFilter -Properties $wmifilterAttr -Server $runDomain | Write-Output
+}
+}
+
+
+##
+####
+######## by Garland Brown - this function is broken.  for now this will be a manual step, fix some day.
+function Set-GPOWMiFilterLink{
+$GPOsnWMiHash=Import-Csv -Path $GpoWmiCsvPath -Header 'GPO','WMIfilterr'
+$global:domainDistinguishedName = (get-addomain).distinguishedname
+ForEach ($property in $GPOsnWMiHash){
+
+$A=$property.Gpo
+$B=$property.wmifilterr
+
+$TargetWmiDn=(Get-ADObject -Properties msWMi-Name -filter 'objectClass -eq "msWMI-Som"'| where msWMi-Name -EQ $B).guid
+
+$TargetGpoid = (Get-GPO -Name $A -Domain $global:domain).Id
+
+$targetGPODN = "CN={$TargetGpoid},CN=Policies,CN=System,$global:domainDistinguishedName"
+
+#Try{
+#if (Get-ADObject -Identity $TargetWmiDn){
+try{Set-ADObject -Identity $targetGPODN -Replace @{gPCWQLFilter = "[$global:domain;{$targetWmiDN};0]"} -PassThru
+}catch{write-host "no workie"}
+}
+}
+
+
+function Invoke-WMIFilterLinking{
+$global:domainDistinguishedname=(get-addomain).distinguishedname
+$global:domain=(gwmi win32_computersystem).domain
+$wmiToGPOLinks = $GpoWmiCsvPath
+
+"Linking WMI Filters"
+
+$wmiToGPOLinks = Import-CSV -Path $wmiToGPOLinks -Header GPOName, WMIFilterName
+
+foreach ($wmiToGPOLink in $wmiToGPOLinks){
+$targetwmiDN = $null
+$targetwmiDN = (Get-GPWmiFilter -Name $wmiToGPOLink.WMIFilterName).Guid
+$targetgpoid = (get-gpo -name $wmiToGPOLink.GPOName -Domain $global:domain).Id
+$WMI_ms_Parm2=Get-ADObject -Properties msWMi-Name, msWMI-Parm2, msWMI-ID -filter 'objectClass -eq "msWMI-Som"'| where msWMi-Name -EQ $wmiToGPOLink.WMIFilterName | select -ExpandProperty "msWMI-Parm2"
+$WMI_ms_WMI_ID=Get-ADObject -Properties msWMi-Name, msWMI-Parm2, msWMI-ID -filter 'objectClass -eq "msWMI-Som"'| where msWMi-Name -EQ $wmiToGPOLink.WMIFilterName | select -ExpandProperty "msWMI-ID"
+$WMI_ms_Parm22 = $WMI_ms_Parm2 -Replace '.*CIMv2'
+$WmiMsParmLength = ($WMI_ms_Parm22).length
+
+$targetGpoDN = (get-gpo -name $wmiToGPOLink.GPOName).Path
+write-host "`n`n"
+#$targetGpoDN
+
+try{
+if (Get-ADObject -Identity $targetGpoDN){
+Set-ADObject -Identity $targetGpoDN -Replace @{gPCWQLFilter = "[$global:domain;$WMI_ms_WMI_ID;0]"} -PassThru
+"[$($wmiToGpolink.GPOName)] linked to [$($wmiToGPOLink.WMIFilterName)]"
+}
+}
+catch{
+     $_.InvocationInfo.MyCommand.Name
+     $_.ErrorDetails.Message
+     $_.InvocationInfo.PositionMessage
+     $_.CategoryInfo.ToString()
+     $_.FullyQualifiedErrorId
+write-host "failed linking wmi filter [$targetwmiDN]"
+#break
+
+}
+}
+}
+
+##use this only if its a first install from DISA Mof files just to know what they have.  their wmil filters likely won't work 100% of the time and will require customization.
+#once you customize the queries the way you like, edit the wminamequery.csv file with the new names and queries and use the function: invoke-WMIFilterCreationCSV
+function invoke-WMIFilterCreation{
+
+$mofFile=Get-ChildItem -Filter '*.mof' -path  $GPOWmiPath -Recurse
+
+foreach ($file in $mofFile){
+
+$Ppath = $file.FullName
+
+[String]$splitVar=Get-Content -Path $Ppath 
+$splitVar| select-string "Query"
+[String]$Query=$splitVar -replace '.*Query = "' -replace '";.*' -replace '\\\\\\\\','\\' -replace '\\"','"'
+$global:Query
+
+[String]$WMIFiltName=Get-Content -Path $Ppath | select-string "Name = "
+$WMIFiltName = $WMIFiltName -replace '.*Name = "' -replace '";.*'
+$global:WMIFiltName
+$namesofNewWMiFilters+=$WMIFiltName
+
+$msWMParm2 = "1;3;10;"+$query.Length +';WQL;root\CIMv2;' + $Query
+
+write-host "`n`n`n`n"
+$msWMParm2
+$WMIGUID=[System.Guid]::NewGuid()
+
+new-WMiFilter -Name $WMIFiltName -Expression $Query -Description $WMIFiltName
+}
+}
+
+function invoke-WMIFilterCreationCSV{
+
+$csvFilePath="C:\temp\GpoSTIGs_2024v1\Artifacts\WmiNameQuery.csv"
+
+$wmiTable=Import-Csv -Path $csvFilePath -Header 'name','query' -Delimiter '|'
+
+#$wmiTable
+
+foreach ($wmiFilter in $wmiTable){
+
+$query=$wmiFilter.Query
+$name=$wmiFilter.name
+
+$msWMParm2 = "1;3;10;"+$query.Length +';WQL;root\CIMv2;' + $Query
+
+write-host "`n`n`n`n"
+$msWMParm2
+$WMIGUID=[System.Guid]::NewGuid()
+
+new-WMiFilter -Name $name -Expression $Query -Description $name
+}
+}
+
+function Get-GPWmiFilter {
+Param
+(
+[Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true, Position = 0, ParameterSetName = "ByGUID")]
+[ValidateNotNull()]
+[Guid[]] $Guid,
+
+[Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true, Position = 0, ParameterSetName = "ByName")]
+[ValidateNotNull()]
+[string[]] $Name,
+
+[Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true, Position = 0, ParameterSetName = "GetAll")]
+[ValidateNotNull()]
+[switch] $All
+)
+if ($Guid){
+$ADObject = get-wmifilterinADObject -Guid $Guid
+}
+elseif ($Name){
+$ADObject = Get-WMIFilterinADObject -Name $Name
+}
+elseif ($All){
+$ADObject = get-wmifilterinADObject -All
+}
+convertto-wmifilter $ADObject | Write-Output
+}
+
+
+
+#################################################################################
+#Main
+####creating backup for roll back
+
+#Backup POlicyDefinitions
+"#1"
+backup-POlicyDefinitions
+
+#backupWMifilters
+"#2"
+Make-GpoWmiCsv
+
+#GPO, WMi and POlicy Definitions backup complete
+#now its time to remove old infrastructure
+
+#backupGPOs
+"#3"
+backup-backupGPOs
+
+#Remove old GPOs and gpo links
+"#4"
+remove-removeGPOs
+
+#remove old wmi filters
+"#5"
+Remove-SameNameOldWmiFilters
+
+#install New GPOs, policy definitions, wmi filters
+
+#Replace policy definitions
+"#6"
+Install-newPolicyDefinitions
+
+#import New GPOs
+"#7"
+Import-AllGPOsFromBackup2
+
+#create new wmi filters
+"#8"
+invoke-WMIFilterCreation
+
+#Installing OUs if necessary
+"#9"
+Install-OUs
+
+#Install GPO WMI filter links
+"#10"
+Invoke-WMIFilterLinking
+
+#set-gpwmifilter
+
+#attach WMi Filters To GPOs, currently this step is manual
+#gpmc.msc
+
+#PAUSE:
+#ContinueorExit
+
+#Install GPO Links, after all WMi filters are linked
+
+"11"
+Install-NewGPOLinks
+
+
+set-location "C:\temp"
+
+Stop-Transcript
