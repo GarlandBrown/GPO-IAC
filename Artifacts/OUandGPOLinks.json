@@ -1,0 +1,31 @@
+"OUs": {
+  "Domain Controllers": [
+    "DoD WinSvr 2012 R2 DC STIG Comp v3r6",
+    "DoD WinSvr 2012 R2 DC STIG User v3r6"
+  ]
+
+  "West Coast":[
+    "DoD Mozilla Firefox STIG v6r5",
+    "DoD Office 2019-M365 Apps STIG Comp v2r10",
+    "DoD Office 2019-M365 Apps STIG User v2r10"  
+  ]
+  "East Coast":[
+    "DoD Mozilla Firefox STIG v6r5",
+    "DoD Office 2019-M365 Apps STIG Comp v2r10",
+    "DoD Office 2019-M365 Apps STIG User v2r10"  
+  ]
+ "East Coast/Workstations":[
+    "DoD Mozilla Firefox STIG v6r5",
+    "DoD Office 2019-M365 Apps STIG Comp v2r10",
+    "DoD Office 2019-M365 Apps STIG User v2r10"  
+  ]
+"East Coast/Member Servers":[
+    "DoD Mozilla Firefox STIG v6r5",
+    "DoD Office 2019-M365 Apps STIG Comp v2r10",
+    "DoD Office 2019-M365 Apps STIG User v2r10"  
+  ]
+
+
+
+  
+},
